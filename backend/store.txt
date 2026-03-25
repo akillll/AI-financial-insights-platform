@@ -1,0 +1,536 @@
+import os
+import json
+from fastapi import HTTPException
+
+from openai import OpenAI
+from pydantic import BaseModel, field_validator
+from sqlalchemy.orm import Session
+from typing import Optional, List
+from dateutil import parser as date_parser
+
+from app.models.household import Household
+from app.models.member import Member
+from app.models.account import Account
+from app.models.investment_profile import InvestmentProfile
+from app.models.bank_account import BankAccount
+from app.models.beneficiary import Beneficiary
+from app.models.investment_experience import InvestmentExperience
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+# ---------- SUB-MODELS ---------- #
+
+class BeneficiaryExtract(BaseModel):
+    name:         Optional[str]   = None
+    relationship: Optional[str]   = None
+    type:         Optional[str]   = None  # "primary" or "contingent"
+    percentage:   Optional[float] = None
+    dob:          Optional[str]   = None
+
+    @field_validator("dob")
+    @classmethod
+    def parse_dob(cls, v):
+        if not v:
+            return None
+        try:
+            return str(date_parser.parse(str(v)).date())
+        except Exception:
+            return None
+
+    @field_validator("percentage")
+    @classmethod
+    def clamp_percentage(cls, v):
+        if v is not None and not (0 <= v <= 100):
+            return None
+        return v
+
+
+class AccountExtract(BaseModel):
+    account_number:       Optional[str]   = None
+    account_type:         Optional[str]   = None
+    custodian:            Optional[str]   = None
+    account_value:        Optional[float] = None
+    ownership:            Optional[str]   = None
+    ownership_percentage: Optional[float] = None
+    decision_making:      Optional[str]   = None
+    source_of_funds:      Optional[str]   = None
+    investment_objective: Optional[str]   = None
+    liquidity_needs:      Optional[str]   = None
+    beneficiaries:        Optional[List[BeneficiaryExtract]] = None  # scoped per account
+
+    @field_validator("account_value")
+    @classmethod
+    def must_be_positive(cls, v):
+        if v is not None and v < 0:
+            return None
+        return v
+
+    @field_validator("ownership_percentage")
+    @classmethod
+    def clamp_percentage(cls, v):
+        if v is not None and not (0 <= v <= 100):
+            return None
+        return v
+
+
+# ---------- MAIN EXTRACT MODEL ---------- #
+
+class AudioExtract(BaseModel):
+    # ── Household ──────────────────────────────────────────────
+    annual_income:    Optional[float] = None
+    total_net_worth:  Optional[float] = None
+    liquid_net_worth: Optional[float] = None
+    expense_range:    Optional[str]   = None
+    tax_bracket:      Optional[str]   = None
+    risk_tolerance:   Optional[str]   = None
+    time_horizon:     Optional[str]   = None
+
+    # ── Member ─────────────────────────────────────────────────
+    first_name:     Optional[str] = None
+    last_name:      Optional[str] = None
+    legal_name:     Optional[str] = None
+    relationship:   Optional[str] = None
+    dob:            Optional[str] = None
+    occupation:     Optional[str] = None
+    employer:       Optional[str] = None
+    marital_status: Optional[str] = None
+    phone:          Optional[str] = None
+    email:          Optional[str] = None
+    address:        Optional[str] = None
+    city:           Optional[str] = None
+    state:          Optional[str] = None
+    country:        Optional[str] = None
+
+    # ── Investment Experience ──────────────────────────────────
+    years_of_experience_bonds:        Optional[int] = None
+    years_of_experience_stocks:       Optional[int] = None
+    years_of_experience_alternatives: Optional[int] = None
+    years_of_experience_vas:          Optional[int] = None
+    years_of_experience_mutual_funds: Optional[int] = None
+    years_of_experience_options:      Optional[int] = None
+    years_of_experience_partnerships: Optional[int] = None
+
+    # ── Accounts (beneficiaries nested inside each account) ────
+    accounts: Optional[List[AccountExtract]] = None
+
+    # ── Bank ───────────────────────────────────────────────────
+    bank_name:           Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_account_type:   Optional[str] = None
+    routing_number:      Optional[str] = None
+
+    # ── Validators ─────────────────────────────────────────────
+
+    @field_validator("annual_income", "total_net_worth", "liquid_net_worth")
+    @classmethod
+    def must_be_positive(cls, v):
+        if v is not None and v < 0:
+            return None
+        return v
+
+    @field_validator("risk_tolerance")
+    @classmethod
+    def normalize_risk(cls, v):
+        if not v:
+            return None
+        v_lower = v.lower().strip()
+        if "conservative" in v_lower and "moderate" in v_lower:
+            return "conservative to moderate"
+        for level in ["conservative", "aggressive", "moderate", "medium", "high", "low"]:
+            if level in v_lower:
+                return level
+        return v
+
+    @field_validator("dob")
+    @classmethod
+    def parse_dob(cls, v):
+        if not v:
+            return None
+        try:
+            return str(date_parser.parse(str(v)).date())
+        except Exception:
+            return None
+
+    @field_validator(
+        "years_of_experience_bonds", "years_of_experience_stocks",
+        "years_of_experience_alternatives", "years_of_experience_vas",
+        "years_of_experience_mutual_funds", "years_of_experience_options",
+        "years_of_experience_partnerships"
+    )
+    @classmethod
+    def must_be_positive_int(cls, v):
+        if v is not None and v < 0:
+            return None
+        return v
+
+
+# ---------- TRANSCRIPTION ---------- #
+
+def transcribe_audio(file) -> str:
+    return client.audio.transcriptions.create(
+        model="gpt-4o-transcribe",
+        file=(file.filename, file.file, file.content_type),
+    ).text
+
+
+# ---------- EXTRACTION ---------- #
+
+def extract_structured_data(transcript: str) -> AudioExtract:
+    prompt = f"""
+You are extracting structured financial data from a wealth manager and client conversation.
+
+Transcript:
+{transcript}
+
+Return ONLY a valid JSON object with these exact keys (set to null if not mentioned):
+
+{{
+  "annual_income": null,
+  "total_net_worth": null,
+  "liquid_net_worth": null,
+  "expense_range": null,
+  "tax_bracket": null,
+  "risk_tolerance": null,
+  "time_horizon": null,
+  "first_name": null,
+  "last_name": null,
+  "legal_name": null,
+  "relationship": null,
+  "dob": null,
+  "occupation": null,
+  "employer": null,
+  "marital_status": null,
+  "phone": null,
+  "email": null,
+  "address": null,
+  "city": null,
+  "state": null,
+  "country": null,
+  "years_of_experience_bonds": null,
+  "years_of_experience_stocks": null,
+  "years_of_experience_alternatives": null,
+  "years_of_experience_vas": null,
+  "years_of_experience_mutual_funds": null,
+  "years_of_experience_options": null,
+  "years_of_experience_partnerships": null,
+  "accounts": [
+    {{
+      "account_number": null,
+      "account_type": null,
+      "custodian": null,
+      "account_value": null,
+      "ownership": null,
+      "ownership_percentage": null,
+      "decision_making": null,
+      "source_of_funds": null,
+      "investment_objective": null,
+      "liquidity_needs": null,
+      "beneficiaries": [
+        {{
+          "name": null,
+          "relationship": null,
+          "type": null,
+          "percentage": null,
+          "dob": null
+        }}
+      ]
+    }}
+  ],
+  "bank_name": null,
+  "bank_account_number": null,
+  "bank_account_type": null,
+  "routing_number": null
+}}
+
+Rules:
+- Extract anything clearly stated OR directly implied by a specific figure or name in the transcript
+- Concrete numbers mentioned conversationally are valid: "$2,400 monthly" → extract it
+- Account types named without account numbers are still extractable (e.g. "401k", "stock portfolio", "real estate")
+- If multiple accounts are mentioned, return each as a separate object in the "accounts" array
+- If no accounts are mentioned, set "accounts" to null (not an empty array)
+- Beneficiaries belong to the account they are mentioned in context of; nest them inside that account object
+- If no beneficiaries are mentioned for an account, set "beneficiaries" to null for that account
+- Convert spoken numbers to digits: "forty thousand" → 40000, "two lakh" → 200000
+- Do NOT infer, guess, or fill in values with no basis in the transcript
+- Set null for anything not clearly mentioned
+- Return ONLY the JSON object, no explanation or markdown
+
+Field-specific rules:
+- first_name / last_name: use professional/preferred name, not legal name
+- legal_name: capture full legal name only if different from preferred name
+- email: personal or preferred email for communications
+- time_horizon: convert retirement age to years remaining e.g. "targeting retirement at 62, currently age 51" → "11 years"; if a range is given use both e.g. "11 to 14 years"
+- risk_tolerance: preserve compound values e.g. "conservative to moderate"
+- tax_bracket: use percentage format e.g. "22%" or descriptive e.g. "Highest"
+- beneficiary type: use "primary" or "contingent" if mentioned
+- source_of_funds on accounts: note origin like "divorce settlement", "inheritance", "earned income" if mentioned
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a financial data extractor. Return only valid JSON matching the exact schema provided."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    )
+
+    raw = json.loads(response.choices[0].message.content)
+    return AudioExtract(**raw)
+
+
+# ---------- DB WRITE ---------- #
+
+def apply_to_db(data: AudioExtract, household_id: int, db: Session) -> dict:
+    try:
+        household = db.query(Household).filter_by(id=household_id).first()
+        if not household:
+            raise HTTPException(status_code=404, detail=f"Household {household_id} not found")
+
+        # --- Update Household ---
+        household_fields = {
+            "annual_income", "total_net_worth", "liquid_net_worth",
+            "expense_range", "tax_bracket", "risk_tolerance", "time_horizon"
+        }
+        updates = data.model_dump(exclude_none=True)
+
+        for field in household_fields:
+            if field in updates:
+                setattr(household, field, updates[field])
+
+        # --- Upsert Member ---
+        member = None
+        if data.first_name:
+            member = db.query(Member).filter_by(
+                household_id=household.id,
+                first_name=data.first_name,
+                last_name=data.last_name
+            ).first()
+
+            if not member:
+                member = Member(
+                    household_id=household.id,
+                    first_name=data.first_name,
+                    last_name=data.last_name
+                )
+                db.add(member)
+                db.flush()
+
+            member_fields = {
+                "legal_name", "relationship", "dob",
+                "occupation", "employer", "marital_status",
+                "phone", "email", "address", "city", "state", "country"
+            }
+            for field in member_fields:
+                if field in updates:
+                    setattr(member, field, updates[field])
+
+        # --- Upsert Investment Experience ---
+        if member:
+            experience_fields = {
+                "years_of_experience_bonds":        "Bonds",
+                "years_of_experience_stocks":       "Stocks",
+                "years_of_experience_alternatives": "Alternatives",
+                "years_of_experience_vas":          "VAs",
+                "years_of_experience_mutual_funds": "Mutual Funds",
+                "years_of_experience_options":      "Options",
+                "years_of_experience_partnerships": "Partnerships",
+            }
+            for field, asset_type in experience_fields.items():
+                years = updates.get(field)
+                if years is None:
+                    continue
+                existing = db.query(InvestmentExperience).filter_by(
+                    member_id=member.id,
+                    asset_type=asset_type
+                ).first()
+                if existing:
+                    existing.years = years
+                else:
+                    db.add(InvestmentExperience(
+                        member_id=member.id,
+                        asset_type=asset_type,
+                        years=years
+                    ))
+
+        # --- Upsert Accounts + nested Beneficiaries ---
+        if data.accounts:
+            for acct_data in data.accounts:
+                acct_dump = acct_data.model_dump(exclude_none=True)
+                if not acct_dump:
+                    continue
+
+                account = None
+                if acct_data.account_type or acct_data.custodian:
+                    account = db.query(Account).filter_by(
+                        household_id=household.id,
+                        account_type=acct_data.account_type,
+                        custodian=acct_data.custodian
+                    ).first()
+
+                if not account:
+                    account = Account(
+                        household_id=household.id,
+                        account_number=acct_data.account_number,
+                        account_type=acct_data.account_type,
+                        custodian=acct_data.custodian,
+                    )
+                    db.add(account)
+                    db.flush()
+
+                updatable = {
+                    "account_value", "ownership", "ownership_percentage",
+                    "decision_making", "source_of_funds"
+                }
+                for field in updatable:
+                    val = acct_dump.get(field)
+                    if val is not None:
+                        setattr(account, field, val)
+
+                # --- Investment Profile ---
+                if acct_data.investment_objective or acct_data.liquidity_needs:
+                    profile = db.query(InvestmentProfile).filter_by(account_id=account.id).first()
+                    if not profile:
+                        profile = InvestmentProfile(account_id=account.id)
+                        db.add(profile)
+
+                    if data.risk_tolerance:
+                        profile.risk_tolerance = data.risk_tolerance
+                    if data.time_horizon:
+                        profile.time_horizon = data.time_horizon
+                    if acct_data.investment_objective:
+                        profile.objective = acct_data.investment_objective
+                    if acct_data.liquidity_needs:
+                        profile.liquidity_needs = acct_data.liquidity_needs
+
+                # --- Beneficiaries scoped to this account ---
+                if acct_data.beneficiaries:
+                    for bene in acct_data.beneficiaries:
+                        if not bene.name:
+                            continue
+                        existing = db.query(Beneficiary).filter_by(
+                            account_id=account.id,
+                            name=bene.name
+                        ).first()
+                        if existing:
+                            if bene.percentage is not None:
+                                existing.percentage = bene.percentage
+                            if bene.dob is not None:
+                                existing.dob = bene.dob
+                            if bene.relationship is not None:
+                                existing.relationship = bene.relationship
+                            if bene.type is not None:
+                                existing.type = bene.type
+                        else:
+                            db.add(Beneficiary(
+                                account_id=account.id,
+                                name=bene.name,
+                                relationship=bene.relationship,
+                                type=bene.type,
+                                percentage=bene.percentage,
+                                dob=bene.dob
+                            ))
+
+        # --- Insert Bank Account ---
+        if data.bank_name:
+            existing_bank = db.query(BankAccount).filter_by(
+                household_id=household.id,
+                bank_name=data.bank_name,
+                account_number=data.bank_account_number
+            ).first()
+            if not existing_bank:
+                db.add(BankAccount(
+                    household_id=household.id,
+                    bank_name=data.bank_name,
+                    account_number=data.bank_account_number,
+                    account_type=data.bank_account_type,
+                    routing_number=data.routing_number
+                ))
+
+        db.commit()
+        return {"household_id": household.id}
+
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+
+# ---------- SERVICE ENTRY POINTS ---------- #
+
+def extract_audio(file, household_id: int, db: Session) -> dict:
+    """Step 1 — transcribe and extract only, no DB writes."""
+    household = db.query(Household).filter_by(id=household_id).first()
+    if not household:
+        raise HTTPException(status_code=404, detail=f"Household {household_id} not found")
+
+    transcript = transcribe_audio(file)
+    extracted = extract_structured_data(transcript)
+
+    return {
+        "transcript": transcript,
+        "extracted": extracted.model_dump(exclude_none=True)
+    }
+
+
+def confirm_audio(data: AudioExtract, household_id: int, db: Session) -> dict:
+    """Step 2 — advisor has reviewed/edited extracted data, now write to DB."""
+    return apply_to_db(data, household_id, db)
+
+
+
+
+============================================ ================================================== ======================================== ============================
+
+
+from fastapi import APIRouter, UploadFile, Depends
+from sqlalchemy.orm import Session
+
+from app.db.session import SessionLocal
+from app.services.audio_service import AudioExtract, extract_audio, confirm_audio
+
+router = APIRouter()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@router.post("/audio/{household_id}/extract")
+def upload_audio(
+    household_id: int,
+    file: UploadFile,
+    db: Session = Depends(get_db)
+):
+    """
+    Step 1: Transcribe audio and extract structured data.
+    Returns transcript + extracted fields for advisor review.
+    Nothing is written to the database.
+    """
+    return extract_audio(file, household_id, db)
+
+
+@router.post("/audio/{household_id}/confirm")
+def confirm_audio_extraction(
+    household_id: int,
+    data: AudioExtract,
+    db: Session = Depends(get_db)
+):
+    """
+    Step 2: Advisor has reviewed (and optionally edited) the extracted data.
+    Writes the confirmed payload to the database.
+    """
+    return confirm_audio(data, household_id, db)
