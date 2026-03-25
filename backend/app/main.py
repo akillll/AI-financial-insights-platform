@@ -11,6 +11,7 @@ app = FastAPI()
 
 origins = [
     "http://localhost:5173", 
+    "https://fasttrackr-akhil.netlify.app/"
 ]
 
 app.add_middleware(
