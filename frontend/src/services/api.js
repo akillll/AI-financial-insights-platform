@@ -1,6 +1,6 @@
 // const BASE_URL = "http://localhost:8000";
 
-const BASE_URL = "https://ai-financial-insights-platform.onrender.com/";
+const BASE_URL = "https://ai-financial-insights-platform.onrender.com";
 
 export const uploadExcel = async (file) => {
   const formData = new FormData();
