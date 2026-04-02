@@ -14,7 +14,7 @@ export default function Sidebar() {
       {/* Logo */}
       <div className="px-6 py-5 border-b border-white/10 text-center">
         <h1 className="text-xl font-semibold tracking-tight">
-          <span className="text-green-400">Fast</span>Trackr
+          <span className="text-green-400">Finance</span>Tracker
         </h1>
         <p className="text-xs text-gray-400 mt-1">
           AI Processing Suite
