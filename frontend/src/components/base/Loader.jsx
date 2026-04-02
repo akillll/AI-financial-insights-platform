@@ -8,7 +8,7 @@ export default function Loader({ text = "Processing your file..." }) {
         {/* Logo */}
         <div className="text-center">
           <h1 className="text-xl font-semibold tracking-tight">
-            <span className="text-green-500">Fast</span>Trackr
+            <span className="text-green-500">Finance</span>Tracker
           </h1>
           <p className="text-xs text-gray-500 mt-1">
             AI-powered data processing
